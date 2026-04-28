@@ -33,10 +33,13 @@ _NAV_REQUIRED = ["utc_1980", "lat", "lon", "alt_msl", "clearance"]
 
 def write_spec(spec_df: pd.DataFrame, out_dir: Path, fid: str) -> Path:
     path = out_dir / f"{fid}_SPEC.parquet"
-    # Write only the canonical columns that exist in spec_df
     cols = [c for c in _SPEC_COLS if c in spec_df.columns]
+    # Append any spectrum array columns (SPEC_spec{N}down_raw pattern)
+    for col in spec_df.columns:
+        if col not in cols and "spec" in col.lower() and "down" in col.lower() and "raw" in col.lower():
+            cols.append(col)
     spec_df[cols].to_parquet(path, index=False)
-    log.info("SPEC → %s  (%d rows)", path.name, len(spec_df))
+    log.info("SPEC → %s  (%d rows, %d cols)", path.name, len(spec_df), len(cols))
     return path
 
 

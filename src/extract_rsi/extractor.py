@@ -70,6 +70,8 @@ def _build_spec_nav(raw: pd.DataFrame, leap: int) -> tuple[pd.DataFrame, pd.Data
 
     Grouping: floor(unix_time) — integer UTC second.
     Counts are summed; GPS is averaged (NaN-safe).
+    Spectrum channels (if present) are summed and packed into a single
+    array-valued column named SPEC_spec{N}down_raw per row.
     """
     raw = raw.copy()
     raw["utc_sec"] = np.floor(raw["unix_time"]).astype(np.int64)
@@ -102,6 +104,23 @@ def _build_spec_nav(raw: pd.DataFrame, leap: int) -> tuple[pd.DataFrame, pd.Data
     # Forward-fill GPS positions over brief dropouts (GPS_ERR transients)
     for col in ["lat", "lon", "alt_msl"]:
         spec[col] = spec[col].ffill().bfill()
+
+    # Spectrum aggregation: sum 2 Hz → 1 Hz and pack as array-per-row
+    spec_cols = sorted(
+        [c for c in raw.columns if c.startswith("down_spec_")],
+        key=lambda c: int(c.split("_")[-1]),
+    )
+    if spec_cols:
+        n_channels = len(spec_cols)
+        spec_arr = (
+            raw.groupby("utc_sec", sort=True)[spec_cols]
+            .sum()
+            .to_numpy()
+            .astype(np.float32)
+        )
+        col_name = f"SPEC_spec{n_channels}down_raw"
+        spec[col_name] = list(spec_arr)
+        log.info("  Spectrum: %d channels packed into %s", n_channels, col_name)
 
     # NAV: GPS position + clearance (no RALT fitted)
     nav = pd.DataFrame({
@@ -150,7 +169,7 @@ def extract(raw_dir: Path, flight_id: str) -> dict:
     if not i2_path.exists():
         i2_path = raw_dir / "RSI_import.i2"
 
-    raw = read_rsibin(rsibin, i2_path=i2_path if i2_path.exists() else None)
+    raw = read_rsibin(rsibin, i2_path=i2_path if i2_path.exists() else None, include_spectra=True)
 
     # Drop zero-timestamp records (pre-acquisition startup)
     valid_mask = raw["unix_time"] > 0
