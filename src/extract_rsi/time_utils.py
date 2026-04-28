@@ -56,3 +56,21 @@ def unix_to_utc_1980(unix_arr: np.ndarray, leap_seconds: int) -> np.ndarray:
     For 2026 data: leap_seconds = 18.
     """
     return (unix_arr.astype(np.float64) - GPS_EPOCH_UNIX) + leap_seconds
+
+
+def assign_2hz_offsets(unix_time: np.ndarray) -> np.ndarray:
+    """Offset the second record of each 2 Hz pair by +0.5 s.
+
+    The RSI records only an integer-second timestamp.  In 2 Hz mode both
+    records in a pair share the same integer value.  This function detects
+    such pairs and shifts the later record by +0.5 s so the output time
+    spine is evenly spaced at 0.5 s intervals.  Records that already have
+    a unique integer timestamp (1 Hz mode) are left unchanged.
+    """
+    t = unix_time.astype(np.float64).copy()
+    int_t = np.floor(t).astype(np.int64)
+    # Mark every record whose integer timestamp equals the preceding record's
+    same_as_prev = np.zeros(len(t), dtype=bool)
+    same_as_prev[1:] = int_t[1:] == int_t[:-1]
+    t[same_as_prev] += 0.5
+    return t

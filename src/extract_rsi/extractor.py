@@ -1,8 +1,11 @@
 """extractor.py — Orchestrate RSI extraction into per-technology DataFrames.
 
-Reads the raw 2-Hz BIN.rsibin, downsamples to 1 Hz, and returns:
-  spec_df : 1 Hz SPEC DataFrame (radiometrics + GPS spine)
-  nav_df  : 1 Hz NAV DataFrame  (GPS position + clearance)
+Reads the raw BIN.rsibin (1 Hz or 2 Hz) and returns DataFrames at the
+native acquisition rate.  In 2 Hz mode, duplicate integer timestamps are
+resolved by offsetting the second record of each pair by +0.5 s.
+
+  spec_df : SPEC DataFrame (radiometrics + GPS spine, at native Hz)
+  nav_df  : NAV DataFrame  (GPS position + clearance, at native Hz)
 """
 from __future__ import annotations
 
@@ -14,7 +17,7 @@ import numpy as np
 import pandas as pd
 
 from .reader import read_rsibin
-from .time_utils import leap_seconds_for_unix, unix_to_utc_1980
+from .time_utils import leap_seconds_for_unix, unix_to_utc_1980, assign_2hz_offsets
 
 log = logging.getLogger(__name__)
 
@@ -66,76 +69,67 @@ def _find_takeoff_landing(nav_df: pd.DataFrame) -> tuple[float | None, float | N
 
 
 def _build_spec_nav(raw: pd.DataFrame, leap: int) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Downsample 2 Hz raw records to 1 Hz SPEC and NAV DataFrames.
+    """Build SPEC and NAV DataFrames at native acquisition rate (1 Hz or 2 Hz).
 
-    Grouping: floor(unix_time) — integer UTC second.
-    Counts are summed; GPS is averaged (NaN-safe).
-    Spectrum channels (if present) are summed and packed into a single
-    array-valued column named SPEC_spec{N}down_raw per row.
+    In 2 Hz mode the RSI records two records per integer second with the same
+    timestamp.  assign_2hz_offsets() shifts the second record by +0.5 s so the
+    time spine is evenly spaced.  No downsampling is applied — all records are
+    preserved at their native rate.
+
+    TC/K/U/Th counts are per-record (counts in 0.5 s at 2 Hz, counts in 1 s at
+    1 Hz).  The _cps suffix reflects the standard SPEC contract column names.
     """
-    raw = raw.copy()
-    raw["utc_sec"] = np.floor(raw["unix_time"]).astype(np.int64)
+    df = raw.copy()
 
-    spec = (
-        raw.groupby("utc_sec", sort=True)
-        .agg(
-            unix_time=("unix_time", "first"),
-            lat=("lat", "mean"),
-            lon=("lon", "mean"),
-            alt_msl=("alt_msl", "mean"),
-            TC_cps=("tc", "sum"),
-            K_cps=("k", "sum"),
-            U_cps=("u", "sum"),
-            Th_cps=("th", "sum"),
-            gps_err=("gps_err", "min"),       # 0 if any record in second had valid GPS
-            down_det=("down_det", "max"),      # detector crystal count
-            down_live_s=("down_live_s", "sum"), # total live time for this second
-            fid=("record_no", "first"),        # first record number (FID equivalent)
-        )
-        .reset_index(drop=True)
-    )
+    # Fix timestamps: second record of each 2 Hz pair gets +0.5 s
+    df["unix_time_adj"] = assign_2hz_offsets(df["unix_time"].to_numpy())
+    df["utc_1980"] = unix_to_utc_1980(df["unix_time_adj"].to_numpy(), leap)
 
-    spec["utc_1980"] = unix_to_utc_1980(spec["unix_time"].to_numpy(), leap)
-
-    # Cast count columns to float64 per SPEC contract
-    for col in ["TC_cps", "K_cps", "U_cps", "Th_cps"]:
-        spec[col] = spec[col].astype(np.float64)
+    spec = pd.DataFrame({
+        "utc_1980":    df["utc_1980"],
+        "lat":         df["lat"],
+        "lon":         df["lon"],
+        "alt_msl":     df["alt_msl"],
+        "TC_cps":      df["tc"].astype(np.float64),
+        "K_cps":       df["k"].astype(np.float64),
+        "U_cps":       df["u"].astype(np.float64),
+        "Th_cps":      df["th"].astype(np.float64),
+        "gps_err":     df["gps_err"],
+        "down_det":    df["down_det"],
+        "down_live_s": df["down_live_s"],
+        "fid":         df["record_no"],
+    })
 
     # Forward-fill GPS positions over brief dropouts (GPS_ERR transients)
     for col in ["lat", "lon", "alt_msl"]:
         spec[col] = spec[col].ffill().bfill()
 
-    # Spectrum aggregation: sum 2 Hz → 1 Hz and pack as array-per-row
+    # Pack spectrum per record (no summation)
     spec_cols = sorted(
-        [c for c in raw.columns if c.startswith("down_spec_")],
+        [c for c in df.columns if c.startswith("down_spec_")],
         key=lambda c: int(c.split("_")[-1]),
     )
     if spec_cols:
         n_channels = len(spec_cols)
-        spec_arr = (
-            raw.groupby("utc_sec", sort=True)[spec_cols]
-            .sum()
-            .to_numpy()
-            .astype(np.float32)
-        )
         col_name = f"SPEC_spec{n_channels}down_raw"
-        spec[col_name] = list(spec_arr)
-        log.info("  Spectrum: %d channels packed into %s", n_channels, col_name)
+        spec[col_name] = list(df[spec_cols].to_numpy().astype(np.float32))
+        log.info("  Spectrum: %d channels per record → %s", n_channels, col_name)
 
-    # NAV: GPS position + clearance (no RALT fitted)
     nav = pd.DataFrame({
-        "utc_1980": spec["utc_1980"],
-        "lat":      spec["lat"],
-        "lon":      spec["lon"],
-        "alt_msl":  spec["alt_msl"],
+        "utc_1980":  spec["utc_1980"],
+        "lat":       spec["lat"],
+        "lon":       spec["lon"],
+        "alt_msl":   spec["alt_msl"],
         "clearance": np.nan,
-        "fid":      spec["fid"],
+        "fid":       spec["fid"],
     })
 
-    log.info("  SPEC: %d rows at 1 Hz", len(spec))
-    log.info("  NAV:  %d rows at 1 Hz", len(nav))
+    dt_median = float(np.median(np.diff(spec["utc_1980"].to_numpy()[:200])))
+    hz = round(1.0 / dt_median) if dt_median > 0 else 0
+    log.info("  SPEC: %d records at ~%d Hz", len(spec), hz)
+    log.info("  NAV:  %d records at ~%d Hz", len(nav), hz)
 
-    return spec, nav
+    return spec.reset_index(drop=True), nav.reset_index(drop=True)
 
 
 def extract(raw_dir: Path, flight_id: str) -> dict:
