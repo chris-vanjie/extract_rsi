@@ -106,7 +106,9 @@ def build_report(
         },
     }
 
-    path = out_dir / f"{fid}_report.json"
+    # Use {fid}_RSI_report.json so it does not collide with {fid}_report.json
+    # when XAGMAG is co-located in the same PROCESSED directory.
+    path = out_dir / f"{fid}_RSI_report.json"
     path.write_text(json.dumps(report, indent=2, default=str))
     log.info("Report → %s", path.name)
     return path
