@@ -38,6 +38,8 @@ ignored here.
 from __future__ import annotations
 
 import logging
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -45,88 +47,205 @@ import pandas as pd
 
 log = logging.getLogger(__name__)
 
-RECORD_SIZE = 2191
 RAD_TO_DEG = 57.295779505601  # 180/π — GPS lat/lon stored in radians in RSI binary
 
-# Numpy structured dtype with explicit byte offsets for efficient bulk extraction.
-# The 'itemsize' key forces each element to span exactly one record.
-_HEADER_DTYPE = np.dtype({
-    "names": [
-        "unix_time",
-        "gdet_err",
-        "tc", "k", "u", "th",
-        "up_roi",
-        "ntr_err", "ntr_total", "ntr_tubes",
-        "adc1", "adc2",
-        "gps_err",
-        "lon_rad", "lat_rad", "alt_m",
-        "down_det",
-        "down_acq_us", "down_live_us",
-        "up_det",
-        "up_live_us",
-    ],
-    "formats": [
-        "<u4",              # unix_time
-        "<i4",              # gdet_err
-        "<i4", "<i4", "<i4", "<i4",  # tc, k, u, th
-        "<i4",              # up_roi
-        "<u2", "<u2", "u1", # ntr_err, ntr_total, ntr_tubes
-        "<f4", "<f4",       # adc1, adc2
-        "u1",               # gps_err
-        "<f4", "<f4", "<f4", # lon_rad, lat_rad, alt_m
-        "u1",               # down_det
-        "<u4", "<u4",       # down_acq_us, down_live_us
-        "u1",               # up_det
-        "<u4",              # up_live_us
-    ],
-    "offsets": [
-        4,
-        19,
-        23, 27, 31, 35,
-        51,
-        65, 67, 70,
-        75, 79,
-        83,
-        96, 100, 104,
-        117,
-        118, 122,
-        1154,
-        1159,
-    ],
-    "itemsize": RECORD_SIZE,
-})
+# Default layout — 512-channel RSI system (survey 9900010).
+# These are used as fallback when no RSI_import.I2 sidecar is present.
+_RECORD_SIZE_DEFAULT   = 2191
+_N_CHANNELS_DEFAULT    = 512
+_DOWN_SPEC_OFFSET_DEFAULT = 130
+_UP_SPEC_OFFSET_DEFAULT   = 1167
 
-# Spectrum section offsets and channel count
-_DOWN_SPEC_OFFSET = 130
-_UP_SPEC_OFFSET   = 1167
-_N_CHANNELS       = 512
+# Keep top-level name for backward-compat imports
+RECORD_SIZE = _RECORD_SIZE_DEFAULT
 
 
-def read_rsibin(path: Path, include_spectra: bool = False) -> pd.DataFrame:
+@dataclass
+class I2Schema:
+    """Key layout parameters extracted from an RSI_import.I2 sidecar."""
+    record_size:       int = _RECORD_SIZE_DEFAULT
+    n_channels:        int = _N_CHANNELS_DEFAULT
+    down_spec_offset:  int = _DOWN_SPEC_OFFSET_DEFAULT
+    up_spec_offset:    int = _UP_SPEC_OFFSET_DEFAULT
+
+
+# Scalar field offsets, formats, and sizes — fixed across all RSI systems
+# (only the spectrum section at the end of the record changes with channel count).
+_SCALAR_NAMES   = [
+    "unix_time",
+    "gdet_err",
+    "tc", "k", "u", "th",
+    "up_roi",
+    "ntr_err", "ntr_total", "ntr_tubes",
+    "adc1", "adc2",
+    "gps_err",
+    "lon_rad", "lat_rad", "alt_m",
+    "down_det",
+    "down_acq_us", "down_live_us",
+    "up_det",
+    "up_live_us",
+]
+_SCALAR_FORMATS = [
+    "<u4",
+    "<i4",
+    "<i4", "<i4", "<i4", "<i4",
+    "<i4",
+    "<u2", "<u2", "u1",
+    "<f4", "<f4",
+    "u1",
+    "<f4", "<f4", "<f4",
+    "u1",
+    "<u4", "<u4",
+    "u1",
+    "<u4",
+]
+_SCALAR_OFFSETS = [
+    4,
+    19,
+    23, 27, 31, 35,
+    51,
+    65, 67, 70,
+    75, 79,
+    83,
+    96, 100, 104,
+    117,
+    118, 122,
+    1154,
+    1159,
+]
+
+
+def _make_header_dtype(record_size: int) -> np.dtype:
+    """Build the scalar-field structured dtype with the correct itemsize."""
+    return np.dtype({
+        "names":    _SCALAR_NAMES,
+        "formats":  _SCALAR_FORMATS,
+        "offsets":  _SCALAR_OFFSETS,
+        "itemsize": record_size,
+    })
+
+
+# Pre-built default dtype (512-channel system)
+_HEADER_DTYPE = _make_header_dtype(_RECORD_SIZE_DEFAULT)
+
+
+def parse_i2(path: Path) -> I2Schema:
+    """Parse an RSI_import.I2 sidecar and return the key layout parameters.
+
+    Extracts RECORDSIZE, DOWN_SPECTRUM channel count and offset, and
+    UP_SPECTRUM offset.  All other fields fall back to defaults so the
+    function is resilient to incomplete or variant I2 files.
+    """
+    schema = I2Schema()
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        log.warning("Could not read I2 sidecar %s: %s", path.name, exc)
+        return schema
+
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+
+        # Keyword = value  (e.g. "RECORDSIZE      2191")
+        upper = line.upper()
+        if upper.startswith("RECORDSIZE") or upper.startswith("BLOCKSIZE"):
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    val = int(parts[1])
+                    if upper.startswith("RECORDSIZE"):
+                        schema.record_size = val
+                except ValueError:
+                    pass
+
+        # DATA / CHAN pair — only care about array channels (spectra)
+        if upper.startswith("DATA") and i + 1 < len(lines):
+            data_rest = line[4:].strip()
+            data_parts = [p.strip() for p in data_rest.split(",")]
+            chan_line = lines[i + 1].strip()
+            if chan_line.upper().startswith("CHAN") and len(data_parts) >= 1:
+                chan_name_raw = chan_line[4:].strip().split(",")[0].strip()
+                arr_m = re.match(r'^(\w+)\{(\d+)\}', chan_name_raw)
+                if arr_m:
+                    name  = arr_m.group(1).upper()
+                    count = int(arr_m.group(2))
+                    try:
+                        offset = int(data_parts[0])
+                    except ValueError:
+                        offset = None
+                    if name == "DOWN_SPECTRUM" and offset is not None:
+                        schema.down_spec_offset = offset
+                        schema.n_channels       = count
+                    elif name == "UP_SPECTRUM" and offset is not None:
+                        schema.up_spec_offset = offset
+
+        i += 1
+
+    log.info(
+        "I2 schema from %s: record_size=%d  n_channels=%d  "
+        "down_spec@%d  up_spec@%d",
+        path.name, schema.record_size, schema.n_channels,
+        schema.down_spec_offset, schema.up_spec_offset,
+    )
+    return schema
+
+
+# Backward-compat aliases (default values)
+_DOWN_SPEC_OFFSET = _DOWN_SPEC_OFFSET_DEFAULT
+_UP_SPEC_OFFSET   = _UP_SPEC_OFFSET_DEFAULT
+_N_CHANNELS       = _N_CHANNELS_DEFAULT
+
+
+def read_rsibin(
+    path: Path,
+    i2_path: Path | None = None,
+    include_spectra: bool = False,
+) -> pd.DataFrame:
     """Read an RSI RadAssist BIN.rsibin file.
 
     Parameters
     ----------
     path            : path to BIN.rsibin
-    include_spectra : if True, add down_spec_0..down_spec_511 columns
-                      (adds ~2 MB per 10k records; omit for routine extraction)
+    i2_path         : path to RSI_import.I2 sidecar (auto-detected if None);
+                      pass False to suppress sidecar lookup entirely
+    include_spectra : if True, add down_spec_0..down_spec_{N-1} columns
 
     Returns
     -------
     Raw 2-Hz DataFrame. GPS lat/lon decoded to decimal degrees; invalid GPS
     positions (GPS_ERR != 0 or position is zero) replaced with NaN.
     """
+    # Resolve sidecar: explicit path, auto-detect sibling, or use defaults
+    schema = I2Schema()
+    if i2_path is not False:
+        candidate = i2_path if i2_path is not None else path.with_name("RSI_import.I2")
+        if not candidate.exists():
+            candidate = path.with_name("RSI_import.i2")
+        if candidate.exists():
+            schema = parse_i2(candidate)
+        else:
+            log.debug("No RSI_import.I2 sidecar found — using hardcoded defaults")
+
+    record_size      = schema.record_size
+    n_channels       = schema.n_channels
+    down_spec_offset = schema.down_spec_offset
+    up_spec_offset   = schema.up_spec_offset
+
+    dtype = _make_header_dtype(record_size)
+
     log.info("Reading %s", path)
     raw_bytes = path.read_bytes()
-    n = len(raw_bytes) // RECORD_SIZE
-    remainder = len(raw_bytes) % RECORD_SIZE
+    n = len(raw_bytes) // record_size
+    remainder = len(raw_bytes) % record_size
     if remainder:
-        log.warning("  File size %d not divisible by RECORD_SIZE %d — %d trailing bytes ignored",
-                    len(raw_bytes), RECORD_SIZE, remainder)
+        log.warning("  File size %d not divisible by record_size %d — %d trailing bytes ignored",
+                    len(raw_bytes), record_size, remainder)
 
     log.info("  %d records (%.2f hours at 2 Hz)", n, n / 2 / 3600)
 
-    arr = np.frombuffer(raw_bytes[: n * RECORD_SIZE], dtype=_HEADER_DTYPE)
+    arr = np.frombuffer(raw_bytes[: n * record_size], dtype=dtype)
 
     df = pd.DataFrame({
         "unix_time":    arr["unix_time"].astype(np.float64),
@@ -160,9 +279,9 @@ def read_rsibin(path: Path, include_spectra: bool = False) -> pd.DataFrame:
     df.loc[invalid_gps, ["lat", "lon", "alt_msl"]] = np.nan
 
     if include_spectra:
-        buf = np.frombuffer(raw_bytes[: n * RECORD_SIZE], dtype=np.uint8).reshape(n, RECORD_SIZE)
-        down = buf[:, _DOWN_SPEC_OFFSET: _DOWN_SPEC_OFFSET + _N_CHANNELS * 2].view("<u2").reshape(n, _N_CHANNELS)
-        for ch in range(_N_CHANNELS):
+        buf = np.frombuffer(raw_bytes[: n * record_size], dtype=np.uint8).reshape(n, record_size)
+        down = buf[:, down_spec_offset: down_spec_offset + n_channels * 2].view("<u2").reshape(n, n_channels)
+        for ch in range(n_channels):
             df[f"down_spec_{ch}"] = down[:, ch].astype(np.int32)
 
     n_valid_gps = df["lat"].notna().sum()

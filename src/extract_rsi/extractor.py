@@ -146,7 +146,11 @@ def extract(raw_dir: Path, flight_id: str) -> dict:
     if not rsibin.exists():
         raise FileNotFoundError(f"BIN.rsibin not found in {raw_dir}")
 
-    raw = read_rsibin(rsibin)
+    i2_path = raw_dir / "RSI_import.I2"
+    if not i2_path.exists():
+        i2_path = raw_dir / "RSI_import.i2"
+
+    raw = read_rsibin(rsibin, i2_path=i2_path if i2_path.exists() else None)
 
     # Drop zero-timestamp records (pre-acquisition startup)
     valid_mask = raw["unix_time"] > 0
