@@ -42,7 +42,7 @@ system data into per-technology parquet DataFrames consumed by `process_flight`.
 | Raw file extension | `.rsibin` |
 | Technologies | Radiometrics (K, U, Th, TC) + GPS |
 | Sample rate | **2 Hz** (two records per integer UTC second, ~0.5 s acquisition each) |
-| Output rate | 1 Hz (pairs summed/averaged) |
+| Output rate | **2 Hz native** — no downsampling. Second record of each pair gets +0.5 s offset so time spine is evenly spaced. |
 | GPS source | Embedded in binary: lon/lat (float32, **radians** ×57.295779505601=°) at offsets 96/100/104 |
 | GPS time | Unix epoch (uint32, seconds since 1970-01-01) at offset 4 |
 | Radar altimeter | **None fitted** — ADC_1/ADC_2 are discrete status inputs, not RALT |
@@ -97,30 +97,38 @@ All outputs written to `{out_dir}/` passed via `--out` CLI flag.
 
 | File | Description |
 |------|-------------|
-| `{fid}_SPEC.parquet` | Radiometrics at 1 Hz + GPS spine + lat/lon/alt_msl |
-| `{fid}_NAV_RSI.parquet` | 1 Hz navigation: GPS position + derived clearance |
+| `{fid}_SPEC.parquet` | Radiometrics at native Hz (2 Hz for 9900010) + GPS spine + spectrum |
+| `{fid}_NAV_RSI.parquet` | NAV at native Hz: GPS position + clearance |
 | `{fid}_RSI_lines.csv` | Line list (see EXTRACT_LINE_LIST_STANDARDS.md) |
-| `{fid}_report.json` | Extraction report — schema in INTEGRATION.md §4a |
+| `{fid}_RSI_report.json` | Extraction report — note: `_RSI_report.json` suffix (not `_report.json`) |
 
 Additional outputs if the instrument carries them:
 - `{fid}_ALT.parquet` — radar altimeter (if present in RSI data stream)
 - `{fid}_metadata.json` — per-file hardware metadata
 
-### SPEC parquet expected columns (RSI)
+### SPEC parquet actual columns (RSI, confirmed against 9900010)
 
 ```
-gps_seconds   float64   GPS seconds since 1980-01-06 (leap-corrected)
-lat           float64   decimal degrees WGS-84
-lon           float64   decimal degrees WGS-84
-alt_msl       float64   metres above mean sea level
-K_cps         float64   potassium window counts per second
-U_cps         float64   uranium window counts per second
-Th_cps        float64   thorium window counts per second
-TC_cps        float64   total count counts per second
-dose_nGy_h    float64   dose rate nGy/h (if available)
+utc_1980              float64   GPS seconds since 1980-01-06 (process_flight adds gps_seconds alias)
+lat                   float64   decimal degrees WGS-84 (forward-filled over GPS dropouts)
+lon                   float64   decimal degrees WGS-84
+alt_msl               float64   metres above mean sea level
+TC_cps                float64   total count ROI — raw counts per 0.5 s record at 2 Hz
+K_cps                 float64   potassium ROI counts per record
+U_cps                 float64   uranium ROI counts per record
+Th_cps                float64   thorium ROI counts per record
+gps_err               uint8     0 = valid GPS, non-zero = error/no lock
+down_det              uint8     number of downward detector crystals active
+down_live_s           float64   live time per record (seconds, ~0.499 at 2 Hz)
+fid                   int64     record_no from raw file (FID equivalent)
+SPEC_spec512down_raw  object    512-element float32 array per row (9900010 system)
 ```
 
-Column names are provisional — confirm against actual RSI output format.
+**Column name normalisation in qc_radiometrics:** `TC_cps → SPEC_tc_raw`, `K_cps → SPEC_k_raw`,
+`U_cps → SPEC_u_raw`, `Th_cps → SPEC_th_raw`. Done automatically on load — no pipeline change needed.
+
+**Dead time:** `spec_dead_frac = 1 - (down_live_s / sample_period)` where `sample_period = 1/hz`.
+qc_radiometrics detects hz from the time column and normalises correctly for both 1 Hz and 2 Hz.
 
 ### NAV parquet required columns
 
@@ -158,12 +166,12 @@ process_flight calls this via subprocess — keep the interface stable.
 | Module | Purpose |
 |--------|---------|
 | `cli.py` | Click CLI entry point; CTL auto-discovery |
-| `time_utils.py` | Unix→GPS time conversion, leap-second table |
-| `reader.py` | Parse BIN.rsibin using numpy structured dtype |
-| `extractor.py` | Read → 2 Hz→1 Hz resample → SPEC + NAV DataFrames |
+| `time_utils.py` | Unix→GPS time conversion, leap-second table, `assign_2hz_offsets()` |
+| `reader.py` | Parse BIN.rsibin via numpy structured dtype; `parse_i2()` for I2 sidecar |
+| `extractor.py` | Read → 2 Hz timestamp fix → SPEC + NAV DataFrames (native rate, no downsample) |
 | `line_detect.py` | GPS track → survey line detection (cross-track angle, 3-pass merge) |
 | `writer.py` | Write SPEC/NAV parquets, RSI_lines.csv, NAV sidecar JSON |
-| `report.py` | Build `{fid}_report.json` |
+| `report.py` | Build `{fid}_RSI_report.json` |
 
 ---
 
