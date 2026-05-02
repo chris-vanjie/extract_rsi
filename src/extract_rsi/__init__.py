@@ -7,7 +7,24 @@ from pathlib import Path
 from typing import Optional
 
 __version__ = "0.1.0"
-__all__ = ["run"]
+__all__ = ["run", "extract"]
+
+
+def extract(
+    input_files,
+    output_dir,
+    flight: str,
+    techs=None,
+    keep_interim: bool = False,
+    dry_run: bool = False,
+) -> dict:
+    """Extract a set of RSI BIN.rsibin files with continuity checking.
+
+    See acq_extract.extract for full documentation.
+    """
+    from .acq_extract import extract as _extract
+    return _extract(input_files, output_dir, flight, techs=techs,
+                    keep_interim=keep_interim, dry_run=dry_run)
 
 
 def run(raw_dir: Path, out_dir: Path, flight_id: str, plan: Optional[Path] = None) -> None:
